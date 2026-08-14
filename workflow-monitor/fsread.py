@@ -122,9 +122,37 @@ def journal_info(run_dir: Path) -> JournalInfo:
     return JournalInfo(key_by_agent, done_agents, done_keys, last_type)
 
 
-def workflow_name(run_dir: Path) -> str:
+def script_candidates(run_dir: Path) -> list[Path]:
+    """The run's .js: looked up in ITS OWN session first, and only if that misses, in the
+    same session id under ANY other project slug.
+
+    The second pass exists because a run and its script can land in two DIFFERENT project
+    directories with the SAME session id. It happens when the workflow is launched against
+    a target inside a subdirectory: Claude Code slugs that subdirectory as its own project
+    and writes the script there, while the run stays under the session's project. The
+    same-session lookup then found nothing and the run was reported with no name at all
+    ("(sin nombre)"), with "ver script" broken on top.
+
+    Ordered, not merged: the own-session hit is the right one whenever it exists, and the
+    fallback only costs a glob over the project dirs for the runs that have no script
+    (16 of 175 in the corpus) -- those pay it on every sweep, hence keeping it second.
+    """
     session_dir = run_dir.parents[2]
-    for s in (session_dir / "workflows" / "scripts").glob(f"*{run_dir.name}.js"):
+    pattern = f"*{run_dir.name}.js"
+    try:
+        own = list((session_dir / "workflows" / "scripts").glob(pattern))
+    except OSError:      # MAX_PATH and friends: a missing script cannot take the sweep down
+        own = []
+    if own:
+        return own
+    try:
+        return list(ROOT.glob(f"*/{session_dir.name}/workflows/scripts/{pattern}"))
+    except OSError:
+        return []
+
+
+def workflow_name(run_dir: Path) -> str:
+    for s in script_candidates(run_dir):
         return s.stem.removesuffix(f"-{run_dir.name}")
     return ""
 
@@ -145,7 +173,10 @@ def list_agent_files(run_dir: Path) -> list[dict]:
 
 def clean_project_slug(slug: str) -> str:
     # Windows slug ("c--Net-8-Tools") or Linux/macOS ("-home-<user>-...", "-Users-<user>-...").
-    return re.sub(r"^[Cc]--(Net-8-)?|^-(?:home|Users)-[^-]+-", "", slug)
+    # ANY drive letter, not just C: a project on D:\ or on a mapped network drive
+    # ("G--My-Drive-IA-Claude-Code") kept its prefix while the C: ones lost theirs, so the
+    # project filter listed the same kind of thing under two different shapes.
+    return re.sub(r"^[A-Za-z]--(Net-8-)?|^-(?:home|Users)-[^-]+-", "", slug)
 
 
 def _content_text(content) -> str:
@@ -275,12 +306,9 @@ def _iter_agent_paths():
 def _run_script(run_dir: Path) -> tuple[Path | None, str | None]:
     """(path, text) of the workflow's .js, or (None, None). An OSError here is normal:
     some paths exceed MAX_PATH, glob enumerates them and read_text fails (1 of 159 in
-    the corpus)."""
-    try:
-        candidates = list((run_dir.parents[2] / "workflows" / "scripts").glob(f"*{run_dir.name}.js"))
-    except OSError:
-        return None, None
-    for s in candidates:
+    the corpus). Uses the same lookup as workflow_name -- see script_candidates: if the
+    name resolves, "ver script" has to resolve too."""
+    for s in script_candidates(run_dir):
         try:
             return s, s.read_text(encoding="utf-8", errors="replace")[:400 * 1024]
         except OSError:
