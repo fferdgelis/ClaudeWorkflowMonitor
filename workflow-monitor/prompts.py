@@ -65,6 +65,16 @@ class MonitorCache:
         self._prompt_chars = 0
         self._families: dict[str, tuple[tuple, list[dict]]] = {}
         self._locations: dict[str, dict] = {}
+        self._convs: dict[str, tuple[int, dict]] = {}
+
+    # ---------- conversations ----------
+    def get_conv(self, key: str) -> tuple[int, dict] | None:
+        with self._lock:
+            return self._convs.get(key)
+
+    def put_conv(self, key: str, size: int, meta: dict) -> None:
+        with self._lock:
+            self._convs[key] = (size, meta)
 
     # ---------- prompts ----------
     def get_prompt(self, key: str, ident: tuple[int, int], size: int) -> dict | None:
@@ -280,6 +290,26 @@ def prompt_families(run_dir, entries: list[dict]) -> list[dict]:
     families.sort(key=lambda f: (-f["n"], f["titulo"]))
     CACHE.put_families(str(run_dir), signature, families)
     return families
+
+
+# How much a conversation has to GROW before its title is read again. The title changes
+# rarely and the last prompt only once per turn, while /api/runs sweeps every conversation
+# every 4 s -- re-reading a 128 KB tail per chat per tick, forever, to almost always get
+# the same answer. Trading a slightly stale title for that is the right side of the deal:
+# the row's state and age come from stat(), so freshness where it matters is unaffected.
+CONV_REFRESH_BYTES = 256 * 1024
+
+
+def conversation_meta(path, size: int) -> dict:
+    """Cached title + last prompt of a conversation. `size` is the caller's stat: the
+    tick already has it, and re-stat-ing here would double the syscalls of the sweep."""
+    key = str(path)
+    hit = CACHE.get_conv(key)
+    if hit is not None and abs(size - hit[0]) < CONV_REFRESH_BYTES:
+        return hit[1]
+    meta = fsread.conversation_meta(path)
+    CACHE.put_conv(key, size, meta)
+    return meta
 
 
 def _location_of(path) -> dict:

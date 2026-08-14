@@ -297,6 +297,81 @@ def agent_activity(path: Path) -> str:
     return ""
 
 
+# ---------------------------------------------------------------- conversations
+# The MAIN conversation of a session is <project>/<session>.jsonl -- a SIBLING of the
+# <session>/ directory that holds its subagents. Nothing else in this app reads it: the
+# monitor was built to watch subagents, so a project where you only ever chat (no Agent
+# tool, no Workflow, no background skill) produced no rows at all and did not even appear
+# in the project filter.
+#
+# Same JSONL event shape as an agent transcript (assistant/user/tool_use/tool_result),
+# plus session-level records that exist ONLY here:
+#   {"type":"custom-title","customTitle":...}  title the user set        -> wins
+#   {"type":"ai-title","aiTitle":...}          title Claude Code derived
+#   {"type":"last-prompt","lastPrompt":...}    the last thing you asked
+# Each of those is APPENDED AGAIN every time it changes, so the LAST occurrence is the
+# current value. They are read from the TAIL and never by parsing the whole file: these
+# are the biggest files on disk (31 MB here) and /api/runs sweeps all of them every 4 s.
+# \s* around the colon unlike the regexes above: those match Claude Code's own compact
+# output, but these three also have to survive a pretty-printed line ('"key": "value"').
+RE_CUSTOM_TITLE = re.compile(r'"customTitle"\s*:\s*"((?:[^"\\]|\\.){1,200})')
+RE_AI_TITLE = re.compile(r'"aiTitle"\s*:\s*"((?:[^"\\]|\\.){1,200})')
+RE_LAST_PROMPT = re.compile(r'"lastPrompt"\s*:\s*"((?:[^"\\]|\\.){1,300})')
+
+CONV_TAIL_BYTES = 128 * 1024
+
+
+def conversation_paths():
+    """<project>/<session>.jsonl. The <session>/ directories and memory/ are not files,
+    so this pattern yields exactly the conversation transcripts."""
+    yield from ROOT.glob("*/*.jsonl")
+
+
+def conversation_meta(path: Path) -> dict:
+    """Current title and last prompt of a conversation, from its tail.
+
+    Forward pass keeping the last hit: the records repeat, and the last one wins. A chat
+    young enough that its whole history still fits before the tail window has its titles
+    at the TOP, hence the head fallback -- without it a brand-new chat showed up unnamed.
+    """
+    custom = ai = last = ""
+    for line in tail_lines(path, CONV_TAIL_BYTES):
+        m = RE_CUSTOM_TITLE.search(line)
+        if m:
+            custom = unescape(m.group(1))
+        m = RE_AI_TITLE.search(line)
+        if m:
+            ai = unescape(m.group(1))
+        m = RE_LAST_PROMPT.search(line)
+        if m:
+            last = unescape(m.group(1))
+    if not (custom or ai):
+        for line in head_lines(path, 8):
+            m = RE_CUSTOM_TITLE.search(line)
+            if m:
+                custom = unescape(m.group(1))
+            m = RE_AI_TITLE.search(line)
+            if m:
+                ai = unescape(m.group(1))
+    return {"titulo": (custom or ai).strip(), "ultimoPrompt": last.strip()}
+
+
+def conversation_first_prompt(path: Path) -> str:
+    """The message that opened the conversation. json.loads per line and not a regex:
+    this one is shown in full, so it must not come back with broken escapes."""
+    for line in head_lines(path, 60):
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(o, dict) and o.get("type") == "user":
+            msg = o.get("message")
+            text = _content_text(msg.get("content") if isinstance(msg, dict) else None)
+            if text.strip():
+                return text
+    return ""
+
+
 def _iter_agent_paths():
     """The only two path shapes that exist. rglob() is out: it steps on dirs beyond MAX_PATH."""
     for pattern in ("*/*/subagents/agent-*.jsonl", "*/*/subagents/workflows/wf_*/agent-*.jsonl"):

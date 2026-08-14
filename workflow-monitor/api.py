@@ -22,7 +22,8 @@ import prompts
 
 # The ids come from the client and are used to build paths: validate them before
 # touching disk.
-RE_VALID_RUN_ID = re.compile(r"^(?:wf_[A-Za-z0-9_-]{1,60}|sueltos_[A-Za-z0-9-]{1,60})$")
+RE_VALID_RUN_ID = re.compile(
+    r"^(?:wf_[A-Za-z0-9_-]{1,60}|sueltos_[A-Za-z0-9-]{1,60}|chat_[A-Za-z0-9-]{1,60})$")
 RE_VALID_AGENT_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 SEARCH_MAX_AGENTS = 200          # max agents returned (the real total is reported anyway)
@@ -68,17 +69,22 @@ def find_run_dir(run_id: str):
 
 
 def _run_row(run: str, workflow: str, project: str, session: str,
-             agents: int, done: int, active: int, status: str, mtime: float, now: float) -> dict:
+             agents: int, done: int, active: int, status: str, mtime: float, now: float,
+             kind: str = "workflow", kb: int = 0) -> dict:
     """Canonical shape of one /api/runs row. The only place a row formats ultimaAct
     (prompt timestamps have their own formatter: fsread._local_ts_label).
 
     `listos` and `activos` do NOT add up to `agentes`: a dead agent counts in neither,
     so the list shows both instead of one ratio that silently hides the difference.
+
+    `tipo` ('workflow' | 'sueltos' | 'chat') exists so the client can tell the three
+    apart WITHOUT sniffing the run-id prefix: a chat has no agent counters to show, and
+    printing "0/0" for it would read like a broken run instead of a conversation.
     """
     return {"run": run, "workflow": workflow, "proyecto": project, "sesion": session,
             "agentes": agents, "listos": done, "activos": active, "estado": status,
             "ultimaAct": datetime.fromtimestamp(mtime).strftime("%d/%m %H:%M"),
-            "edadSeg": int(now - mtime)}
+            "edadSeg": int(now - mtime), "tipo": kind, "kb": kb}
 
 
 def _loose_agent_runs(now: float) -> list[dict]:
@@ -108,7 +114,50 @@ def _loose_agent_runs(now: float) -> list[dict]:
             done=sum(1 for t in mtimes if now - t > AGENT_IDLE_SECS),
             active=sum(1 for t in mtimes if now - t < AGENT_ACTIVE_SECS),
             status="ACTIVO" if now - mtime < RUN_ACTIVE_SECS else "TERMINADO",
-            mtime=mtime, now=now))
+            mtime=mtime, now=now, kind="sueltos"))
+    return rows
+
+
+def find_conversation(run_id: str):
+    """<project>/<session>.jsonl for a 'chat_<session>' id, or None.
+
+    Same discipline as find_run_dir: the id comes from the client and goes into a glob,
+    so it is validated against the charset FIRST -- no dots, no separators, none of
+    glob's metacharacters (*?[]) survive it.
+    """
+    if not RE_VALID_RUN_ID.match(run_id or "") or not run_id.startswith("chat_"):
+        return None
+    sess = run_id.removeprefix("chat_")
+    for p in fsread.ROOT.glob(f"*/{sess}.jsonl"):
+        return p
+    return None
+
+
+def _conversation_runs(now: float) -> list[dict]:
+    """One row per CONVERSATION. These are not runs of anything -- they are the chats
+    themselves -- but they ride in the same list on purpose: what you want to see is
+    everything that is moving right now, and until this existed a project where you only
+    ever chatted was invisible to the monitor and missing from the project filter.
+
+    A chat has no journal and no notion of 'finished', so it is only ACTIVO or INACTIVO;
+    reporting TERMINADO would claim something the file cannot support.
+    """
+    rows = []
+    for path in fsread.conversation_paths():
+        try:
+            st = path.stat()
+        except OSError:      # vanished mid-sweep, or past MAX_PATH
+            continue
+        if not S_ISREG(st.st_mode):
+            continue
+        meta = prompts.conversation_meta(path, st.st_size)
+        sess = path.stem
+        rows.append(_run_row(
+            "chat_" + sess, meta["titulo"] or "(chat sin titulo)",
+            fsread.clean_project_slug(path.parent.name), sess[:8],
+            agents=0, done=0, active=0,
+            status="ACTIVO" if now - st.st_mtime < RUN_ACTIVE_SECS else "INACTIVO",
+            mtime=st.st_mtime, now=now, kind="chat", kb=st.st_size // 1024))
     return rows
 
 
@@ -137,7 +186,9 @@ def _workflow_runs(now: float) -> list[dict]:
 
 def api_runs() -> list[dict]:
     now = time.time()
-    runs = _loose_agent_runs(now) + _workflow_runs(now)
+    # Mixed in one list and sorted by recency: what matters is what moved last, whether
+    # that was a workflow, a loose agent or you typing in a chat.
+    runs = _loose_agent_runs(now) + _workflow_runs(now) + _conversation_runs(now)
     runs.sort(key=lambda r: r["edadSeg"])
     return runs
 
@@ -165,7 +216,38 @@ def _uptime_secs(entry: dict | None, now: float) -> int | None:
         return None
 
 
+def _chat_run(run_id: str) -> dict | None:
+    """A conversation dressed as a run with ONE agent: the chat itself.
+
+    Deliberately the same shape as any other run, so the whole client works on it
+    unchanged -- list -> detail -> feed -- instead of needing a second screen.
+    """
+    path = find_conversation(run_id)
+    if not path:
+        return None
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    now = time.time()
+    age = int(now - st.st_mtime)
+    meta = prompts.conversation_meta(path, st.st_size)
+    return {"run": run_id, "workflow": meta["titulo"] or "(chat sin titulo)",
+            "agentes": [{
+                "id": "chat", "kb": st.st_size // 1024, "edadSeg": age,
+                "estado": "ACTIVO" if age < AGENT_ACTIVE_SECS else "INACTIVO",
+                "uptimeSeg": None,   # a chat has no spawn instant: it is not a run
+                "mision": meta["ultimoPrompt"] or meta["titulo"] or "?",
+                "promptChars": 0,
+                # Only for a chat that is still moving: agent_activity reads the tail,
+                # and doing that for every idle conversation on every tick is waste.
+                "actividad": fsread.agent_activity(path) if age < AGENT_IDLE_SECS else "",
+            }]}
+
+
 def api_run(run_id: str) -> dict | None:
+    if (run_id or "").startswith("chat_"):
+        return _chat_run(run_id)
     run_dir = find_run_dir(run_id)
     if not run_dir:
         return None
@@ -203,14 +285,10 @@ def api_run(run_id: str) -> dict | None:
             "agentes": agents}
 
 
-def api_agent(run_id: str, agent_id: str, n: int = 120) -> dict | None:
-    run_dir = find_run_dir(run_id)
-    if not run_dir or not RE_VALID_AGENT_ID.match(agent_id or ""):
-        return None
-    matches = list(run_dir.glob(f"agent-{agent_id}*.jsonl"))
-    if not matches:
-        return None
-    path = matches[0]
+def _transcript_events(path) -> list[dict]:
+    """Feed of a transcript, from its tail. Works for an agent AND for a conversation:
+    both are the same JSONL event stream (assistant / tool_use / tool_result), which is
+    why the chat view costs no parser of its own."""
     events = []
     for line in fsread.tail_lines(path):
         ts = fsread.local_hhmmss(line)
@@ -235,10 +313,33 @@ def api_agent(run_id: str, agent_id: str, n: int = 120) -> dict | None:
             if m:
                 preview = "  · " + fsread.unescape(m.group(1)).strip()
             events.append({"ts": ts, "tipo": "RES", "txt": f"({max(1, len(line) // 1024)} KB){preview}"})
+    return events
+
+
+def api_agent(run_id: str, agent_id: str, n: int = 120) -> dict | None:
+    if (run_id or "").startswith("chat_"):
+        path = find_conversation(run_id)
+        if not path or agent_id != "chat":   # a chat has exactly one pseudo-agent
+            return None
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        meta = prompts.conversation_meta(path, size)
+        return {"agente": path.stem[:8],
+                "mision": meta["ultimoPrompt"] or meta["titulo"] or "?",
+                "eventos": _transcript_events(path)[-n:]}
+    run_dir = find_run_dir(run_id)
+    if not run_dir or not RE_VALID_AGENT_ID.match(agent_id or ""):
+        return None
+    matches = list(run_dir.glob(f"agent-{agent_id}*.jsonl"))
+    if not matches:
+        return None
+    path = matches[0]
     e = prompts.prompt_entry(path)
     return {"agente": path.stem,
             "mision": prompts.mission_of(e) if e else fsread.agent_mission(path),
-            "eventos": events[-n:]}
+            "eventos": _transcript_events(path)[-n:]}
 
 
 def api_prompts(run_id: str) -> dict | None:
@@ -267,6 +368,24 @@ _PROMPT_FIELDS = {"texto": "", "chars": 0, "kb": 0, "ts": "", "cwd": "", "gitBra
 
 def api_prompt(run_id: str, agent_id: str) -> dict | None:
     """FULL prompt of one agent. Untruncated: the 378 KB one is precisely an interesting one."""
+    if (run_id or "").startswith("chat_"):
+        # A chat has no launch prompt, but it does have the message that OPENED it, and
+        # that is the closest analogue: what this conversation was started to do.
+        path = find_conversation(run_id)
+        if not path or agent_id != "chat":
+            return None
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        texto = fsread.conversation_first_prompt(path)
+        meta = prompts.conversation_meta(path, st.st_size)
+        return {"run": run_id, "agente": "chat", **_PROMPT_FIELDS,
+                "titulo": meta["titulo"] or prompts.title_of(texto),
+                "texto": texto, "chars": len(texto), "kb": st.st_size // 1024,
+                "description": "mensaje que abrio la conversacion",
+                "cwd": "", "pre": 0, "suf": 0, "familia": 1,
+                "aviso": "" if texto else "no pude leer el primer mensaje de este chat"}
     run_dir = find_run_dir(run_id)
     if not run_dir or not RE_VALID_AGENT_ID.match(agent_id or ""):
         return None
@@ -348,6 +467,11 @@ def api_plan(run_id: str) -> dict | None:
     Inferring it would display an invented progression, so the plan is shown as declared
     and the progress separately.
     """
+    if (run_id or "").startswith("chat_"):
+        if not find_conversation(run_id):
+            return None
+        return {"run": run_id, "agentes": 1, "terminados": 0,
+                "plan": None, "script": "", "motivo": "chat"}
     run_dir = find_run_dir(run_id)
     if not run_dir:
         return None

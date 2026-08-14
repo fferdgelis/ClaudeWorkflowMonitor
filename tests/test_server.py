@@ -200,7 +200,8 @@ def test_api_runs_integration(tmp_path, monkeypatch):
     # Freezes the JSON contract of a /api/runs row.
     for r in rows:
         assert set(r) == {"run", "workflow", "proyecto", "sesion", "agentes",
-                          "listos", "activos", "estado", "ultimaAct", "edadSeg"}
+                          "listos", "activos", "estado", "ultimaAct", "edadSeg",
+                          "tipo", "kb"}
     by_run = {r["run"]: r for r in rows}
     assert set(by_run) == {"wf_abc123", "sueltos_sesionffff9999"}
 
@@ -279,3 +280,75 @@ def test_api_runs_missing_root(tmp_path, monkeypatch):
     # Freshly installed machine, no ~/.claude/projects: empty list, not a 500.
     monkeypatch.setattr(fsread, "ROOT", tmp_path / "no-existe")
     assert api.api_runs() == []
+
+
+# ---------------------------------------------------------------- conversations
+
+def write_chat(project_dir, session, titulo=None, ai_titulo=None, ultimo=None,
+               primer="Hola, arranquemos con esto."):
+    """Minimal <project>/<session>.jsonl. Mirrors what Claude Code appends: the opening
+    user message plus the session records, each RE-APPENDED whenever it changes."""
+    project_dir.mkdir(parents=True, exist_ok=True)
+    lines = [{"type": "user", "timestamp": "2026-08-01T10:00:00Z",
+              "message": {"content": primer}}]
+    if ai_titulo:
+        lines.append({"type": "ai-title", "aiTitle": ai_titulo, "sessionId": session})
+    if titulo:
+        lines.append({"type": "custom-title", "customTitle": titulo, "sessionId": session})
+    if ultimo:
+        lines.append({"type": "last-prompt", "lastPrompt": ultimo, "sessionId": session})
+    f = project_dir / f"{session}.jsonl"
+    f.write_text("".join(json.dumps(o) + "\n" for o in lines), encoding="utf-8")
+    return f
+
+
+def test_chat_aparece_en_runs_aunque_no_haya_subagentes(tmp_path, monkeypatch):
+    # El caso que motivo la funcion: un proyecto donde SOLO se conversa. Antes no
+    # producia ninguna fila y ni siquiera figuraba en el filtro de proyectos.
+    monkeypatch.setattr(fsread, "ROOT", tmp_path)
+    write_chat(tmp_path / "c--Demo", "aaaabbbbccccdddd",
+               ai_titulo="Titulo puesto por la IA", ultimo="segui con el paso 3")
+
+    rows = api.api_runs()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["tipo"] == "chat"
+    assert r["run"] == "chat_aaaabbbbccccdddd"
+    assert r["proyecto"] == "Demo"
+    assert r["workflow"] == "Titulo puesto por la IA"
+    assert r["estado"] == "ACTIVO"           # recien escrito
+    assert r["agentes"] == 0                 # un chat no tiene agentes que contar
+
+
+def test_chat_prefiere_el_titulo_del_usuario(tmp_path, monkeypatch):
+    monkeypatch.setattr(fsread, "ROOT", tmp_path)
+    write_chat(tmp_path / "c--Demo", "1111222233334444",
+               titulo="El que puse yo", ai_titulo="El que invento la IA")
+    assert api.api_runs()[0]["workflow"] == "El que puse yo"
+
+
+def test_chat_run_agente_y_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr(fsread, "ROOT", tmp_path)
+    write_chat(tmp_path / "c--Demo", "5555666677778888",
+               titulo="Mi chat", ultimo="dale con eso", primer="Arranquemos por aca.")
+
+    d = api.api_run("chat_5555666677778888")
+    assert d is not None and len(d["agentes"]) == 1
+    a = d["agentes"][0]
+    assert a["id"] == "chat" and a["estado"] == "ACTIVO"
+    assert a["mision"] == "dale con eso"     # el ultimo prompt, no el titulo
+
+    p = api.api_prompt("chat_5555666677778888", "chat")
+    assert p is not None and p["texto"] == "Arranquemos por aca."
+
+    # El plan explica por que no hay plan, en vez de devolver 404 pelado.
+    assert api.api_plan("chat_5555666677778888")["motivo"] == "chat"
+
+
+def test_chat_id_invalido_no_toca_disco(tmp_path, monkeypatch):
+    # Mismo criterio que find_run_dir: el id viene del cliente y termina en un glob.
+    monkeypatch.setattr(fsread, "ROOT", tmp_path)
+    write_chat(tmp_path / "c--Demo", "9999888877776666")
+    for malo in ("chat_../../etc/passwd", "chat_*", "chat_", "chat_a/b", ""):
+        assert api.find_conversation(malo) is None
+        assert api.api_run(malo) is None
