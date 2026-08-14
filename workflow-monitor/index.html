@@ -102,6 +102,8 @@
   .b-ESTANCADO, .b-MUERTO { background: var(--bad-bg); color: var(--bad); }
   .b-LENTO { background: var(--warn-bg); color: var(--warn); }
   .b-REEMPLAZADO { background: var(--muted-bg); color: var(--muted); }
+  /* INACTIVO es de los CHATS: una conversacion no "termina", solo deja de moverse. */
+  .b-INACTIVO { background: var(--muted-bg); color: var(--muted); }
   .wf { font-weight: 600; }
   .sub { color: var(--muted); font-size: 11.5px; }
   /* lista de runs: fixed + ellipsis. Sin esto los nombres largos de proyecto
@@ -286,7 +288,11 @@ function pintarRuns() {
   repintar($("#runs"), filas.map(r => {
     const nombre = esc(r.workflow) || "(sin nombre)";
     const donde = `${esc(r.proyecto)} · ${r.sesion}`;
-    const cuenta = `${r.listos}/${r.agentes} · ${fmtEdad(r.edadSeg)}`;
+    // Un chat no tiene agentes que contar: "0/0" se leeria como un run roto. Va su
+    // tamaño, que es lo que dice cuanto pasó en esa conversacion.
+    const cuenta = r.tipo === "chat"
+      ? `${kb(r.kb * 1024)} · ${fmtEdad(r.edadSeg)}`
+      : `${r.listos}/${r.agentes} · ${fmtEdad(r.edadSeg)}`;
     return `
     <tr class="row ${r.run===selRun?"sel":""}" data-k="${idsafe(r.run)}" onclick="verRun('${idsafe(r.run)}')"
         title="${nombre} — ${donde}\n${r.activos} activos · ${r.listos} de ${r.agentes} terminados · última actividad ${r.ultimaAct}">
@@ -319,6 +325,7 @@ const SIN_PLAN = {
   "sin-script": "Este run no dejó su script en disco, así que no se puede mostrar su plan.",
   "ilegible": "El script existe pero no se pudo leer (ruta demasiado larga o sin permisos).",
   "sin-meta": "El script no declara un bloque meta, así que no hay plan que mostrar.",
+  "chat": "Es una conversación, no un workflow: no hay plan declarado. Abrí el agente para ver su actividad, o “prompt” para el mensaje que la abrió.",
 };
 
 async function cargarPlan(run) {
