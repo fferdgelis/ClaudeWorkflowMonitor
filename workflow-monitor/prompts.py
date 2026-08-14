@@ -66,6 +66,7 @@ class MonitorCache:
         self._families: dict[str, tuple[tuple, list[dict]]] = {}
         self._locations: dict[str, dict] = {}
         self._convs: dict[str, tuple[int, dict]] = {}
+        self._codex: dict[str, tuple[int, dict]] = {}
 
     # ---------- conversations ----------
     def get_conv(self, key: str) -> tuple[int, dict] | None:
@@ -75,6 +76,15 @@ class MonitorCache:
     def put_conv(self, key: str, size: int, meta: dict) -> None:
         with self._lock:
             self._convs[key] = (size, meta)
+
+    # ---------- codex ----------
+    def get_codex(self, key: str) -> tuple[int, dict] | None:
+        with self._lock:
+            return self._codex.get(key)
+
+    def put_codex(self, key: str, size: int, entry: dict) -> None:
+        with self._lock:
+            self._codex[key] = (size, entry)
 
     # ---------- prompts ----------
     def get_prompt(self, key: str, ident: tuple[int, int], size: int) -> dict | None:
@@ -310,6 +320,28 @@ def conversation_meta(path, size: int) -> dict:
     meta = fsread.conversation_meta(path)
     CACHE.put_conv(key, size, meta)
     return meta
+
+
+def codex_entry(path, size: int) -> dict:
+    """Cached (metadata + tail state) of a Codex rollout.
+
+    Keyed on SIZE and nothing else, because a rollout is append-only: while it has not
+    grown, nothing in it changed, and a finished session never grows again. That is what
+    makes this affordable -- the corpus here is 277 MB across 178 rollouts, and without
+    the cache every 4 s tick would re-read a 256 KB tail per session forever. In steady
+    state the sweep costs one stat() per file.
+
+    Deliberately NOT keyed by mtime: an append bumps mtime AND size together, so size
+    alone already catches every real change, and mtime alone would miss nothing but cost
+    a re-read on every touch.
+    """
+    key = str(path)
+    hit = CACHE.get_codex(key)
+    if hit is not None and hit[0] == size:
+        return hit[1]
+    entry = {"meta": fsread.codex_meta(path), **fsread.codex_tail(path)}
+    CACHE.put_codex(key, size, entry)
+    return entry
 
 
 def _location_of(path) -> dict:

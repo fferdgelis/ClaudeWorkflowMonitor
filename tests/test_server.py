@@ -201,7 +201,7 @@ def test_api_runs_integration(tmp_path, monkeypatch):
     for r in rows:
         assert set(r) == {"run", "workflow", "proyecto", "sesion", "agentes",
                           "listos", "activos", "estado", "ultimaAct", "edadSeg",
-                          "tipo", "kb"}
+                          "tipo", "kb", "tokens"}
     by_run = {r["run"]: r for r in rows}
     assert set(by_run) == {"wf_abc123", "sueltos_sesionffff9999"}
 
@@ -352,3 +352,146 @@ def test_chat_id_invalido_no_toca_disco(tmp_path, monkeypatch):
     for malo in ("chat_../../etc/passwd", "chat_*", "chat_", "chat_a/b", ""):
         assert api.find_conversation(malo) is None
         assert api.api_run(malo) is None
+
+
+# ---------------------------------------------------------------- codex
+
+def write_rollout(day_dir, session_id, *, cwd=r"C:\proy\demo", ciclo="complete",
+                  tokens=1000, cache=800, ventana=250000, mensaje="Listo, verificado.",
+                  primer="Revisa el modulo de pagos.", tool="exec"):
+    """Rollout minimo con la forma real de Codex: session_meta en la linea 0 y despues
+    event_msg / response_item, uno por linea."""
+    day_dir.mkdir(parents=True, exist_ok=True)
+    L = [
+        {"timestamp": "2026-08-14T06:00:00.0Z", "type": "session_meta",
+         "payload": {"session_id": session_id, "cwd": cwd, "cli_version": "0.147.0",
+                     "model_provider": "openai"}},
+        {"timestamp": "2026-08-14T06:00:01.0Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "1"}},
+        {"timestamp": "2026-08-14T06:00:02.0Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": primer}},
+        {"timestamp": "2026-08-14T06:00:03.0Z", "type": "response_item",
+         "payload": {"type": "custom_tool_call", "name": tool, "input": "ls -la"}},
+        {"timestamp": "2026-08-14T06:00:04.0Z", "type": "response_item",
+         "payload": {"type": "custom_tool_call_output",
+                     "output": [{"type": "input_text", "text": "ok"}]}},
+        {"timestamp": "2026-08-14T06:00:05.0Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": mensaje}},
+        {"timestamp": "2026-08-14T06:00:06.0Z", "type": "event_msg",
+         "payload": {"type": "token_count", "info": {
+             "total_token_usage": {"input_tokens": 900, "cached_input_tokens": cache,
+                                   "output_tokens": 100, "reasoning_output_tokens": 20,
+                                   "total_tokens": tokens},
+             # el ULTIMO turno, no el acumulado: es lo que ocupa la ventana ahora
+             "last_token_usage": {"input_tokens": 300, "cached_input_tokens": 250,
+                                  "output_tokens": 40, "total_tokens": 340},
+             "model_context_window": ventana}}},
+    ]
+    if ciclo == "complete":
+        L.append({"timestamp": "2026-08-14T06:00:07.0Z", "type": "event_msg",
+                  "payload": {"type": "task_complete", "turn_id": "1"}})
+    f = day_dir / f"rollout-2026-08-14T06-00-00-{session_id}.jsonl"
+    f.write_text("".join(json.dumps(o) + "\n" for o in L), encoding="utf-8")
+    return f
+
+
+def test_codex_aparece_en_runs_con_tokens(tmp_path, monkeypatch):
+    monkeypatch.setattr(fsread, "ROOT", tmp_path / "claude")
+    monkeypatch.setattr(fsread, "CODEX_ROOT", tmp_path / "codex")
+    write_rollout(tmp_path / "codex" / "2026" / "08" / "14",
+                  "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", tokens=1300785)
+
+    rows = api.api_runs()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["tipo"] == "codex"
+    assert r["run"] == "codex_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    assert r["estado"] == "TERMINADO"          # el ultimo evento de ciclo es task_complete
+    assert r["tokens"] == 1300785              # el dato que Claude Code no escribe
+    assert r["proyecto"] == "demo"             # del cwd de session_meta
+
+
+def test_codex_estado_manda_el_ultimo_evento_no_la_frescura():
+    # Igual que run_status con el journal: un turno abierto y quieto es ESTANCADO, no
+    # TERMINADO; y sin ningun evento de ciclo en la cola se admite no saber.
+    assert api._codex_estado("complete", 99999) == "TERMINADO"
+    assert api._codex_estado("started", 5) == "ACTIVO"
+    assert api._codex_estado("started", 99999) == "ESTANCADO"
+    assert api._codex_estado(None, 5) == "?"
+
+
+def test_codex_detalle_feed_y_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr(fsread, "ROOT", tmp_path / "claude")
+    monkeypatch.setattr(fsread, "CODEX_ROOT", tmp_path / "codex")
+    sid = "11111111-2222-3333-4444-555555555555"
+    write_rollout(tmp_path / "codex" / "2026" / "08" / "14", sid,
+                  primer="Auditá el bridge.", mensaje="Encontré dos problemas.", tool="exec")
+    rid = "codex_" + sid
+
+    d = api.api_run(rid)
+    assert d is not None and len(d["agentes"]) == 1
+    a = d["agentes"][0]
+    assert a["id"] == "codex" and a["estado"] == "TERMINADO"
+    assert a["mision"] == "Encontré dos problemas."
+    assert a["tokens"] == 1000 and a["tokensCache"] == 800 and a["ventana"] == 250000
+    # La ocupacion de la ventana sale del ULTIMO turno (300), no del acumulado de entrada
+    # (900). Confundirlos mostraba porcentajes de contexto por encima del 100%.
+    assert a["contextoUso"] == 300
+
+    f = api.api_agent(rid, "codex")
+    assert f is not None
+    tipos = [e["tipo"] for e in f["eventos"]]
+    assert "TOOL" in tipos and "RES" in tipos and "DICE" in tipos
+
+    p = api.api_prompt(rid, "codex")
+    assert p is not None and p["texto"] == "Auditá el bridge."
+    assert api.api_plan(rid)["motivo"] == "codex"
+
+
+def test_codex_id_invalido_no_toca_disco(tmp_path, monkeypatch):
+    monkeypatch.setattr(fsread, "CODEX_ROOT", tmp_path / "codex")
+    write_rollout(tmp_path / "codex" / "2026" / "08" / "14",
+                  "99999999-8888-7777-6666-555555555555")
+    for malo in ("codex_../../etc/passwd", "codex_*", "codex_", "codex_a/b", ""):
+        assert api.find_codex(malo) is None
+        assert api.api_run(malo) is None
+
+
+def test_codex_cache_no_relee_si_no_crecio(tmp_path, monkeypatch):
+    # El cache es lo que hace viable barrer 277 MB cada 4 s: se keyea por TAMANO, porque
+    # un rollout es append-only y uno terminado ya no crece nunca mas.
+    monkeypatch.setattr(fsread, "CODEX_ROOT", tmp_path / "codex")
+    f = write_rollout(tmp_path / "codex" / "2026" / "08" / "14",
+                      "abcdabcd-0000-1111-2222-333333333333")
+    llamadas = {"n": 0}
+    real = fsread.codex_tail
+
+    def contando(path):
+        llamadas["n"] += 1
+        return real(path)
+
+    monkeypatch.setattr(fsread, "codex_tail", contando)
+    size = f.stat().st_size
+    prompts.codex_entry(f, size)
+    prompts.codex_entry(f, size)
+    prompts.codex_entry(f, size)
+    assert llamadas["n"] == 1               # dos hits de cache
+    prompts.codex_entry(f, size + 10)       # crecio -> hay que releer
+    assert llamadas["n"] == 2
+
+
+def test_codex_project_atribuye_al_padre_y_no_ensucia_el_filtro():
+    p = fsread.codex_project
+    # 1. cwd dentro del scratchpad de una sesion de Claude Code -> gana el proyecto padre.
+    #    Es lo que hace visible que ese Codex lo lanzo esa sesion.
+    assert p({"cwd": r"C:\Users\x\AppData\Local\Temp\claude\C--IA-Projects-whatsapp-mcp"
+                     r"\c9a32750-1111\scratchpad\wt-a79326a"}) == "IA-Projects-whatsapp-mcp"
+    # 2. si no, el repo de git que Codex anota.
+    assert p({"cwd": r"C:\algo", "git": {"repository_url":
+              "https://github.com/lharries/whatsapp-mcp.git"}}) == "whatsapp-mcp"
+    # 3. el scratch propio de Codex no es un proyecto: una etiqueta, no un pedazo de prompt.
+    assert p({"cwd": r"C:\Users\x\Documents\Codex\2026-07-05\let-s-set-up-a-scheduled"}) \
+        == "(Codex sin proyecto)"
+    # 4. un directorio de verdad se usa tal cual.
+    assert p({"cwd": r"C:\Users\x\Documents\TunBridge"}) == "TunBridge"
+    assert p({}) == "?"

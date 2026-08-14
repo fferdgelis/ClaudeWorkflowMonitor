@@ -84,6 +84,11 @@ class Handler(BaseHTTPRequestHandler):
                 body = (HERE / "index.html").read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                # Mismo no-store que las respuestas JSON. Sin esto el navegador se queda
+                # con el index.html viejo despues de editarlo y hace falta un recargado
+                # forzado para ver el cambio -- se pierde tiempo creyendo que el codigo
+                # nuevo no anda cuando lo que corre es el anterior.
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
             elif url.path == "/api/ping":

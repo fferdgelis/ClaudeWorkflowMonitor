@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from stat import S_ISREG
 
 import fsread
@@ -23,7 +24,8 @@ import prompts
 # The ids come from the client and are used to build paths: validate them before
 # touching disk.
 RE_VALID_RUN_ID = re.compile(
-    r"^(?:wf_[A-Za-z0-9_-]{1,60}|sueltos_[A-Za-z0-9-]{1,60}|chat_[A-Za-z0-9-]{1,60})$")
+    r"^(?:wf_[A-Za-z0-9_-]{1,60}|sueltos_[A-Za-z0-9-]{1,60}"
+    r"|chat_[A-Za-z0-9-]{1,60}|codex_[A-Za-z0-9-]{1,60})$")
 RE_VALID_AGENT_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 SEARCH_MAX_AGENTS = 200          # max agents returned (the real total is reported anyway)
@@ -70,21 +72,25 @@ def find_run_dir(run_id: str):
 
 def _run_row(run: str, workflow: str, project: str, session: str,
              agents: int, done: int, active: int, status: str, mtime: float, now: float,
-             kind: str = "workflow", kb: int = 0) -> dict:
+             kind: str = "workflow", kb: int = 0, tokens: int | None = None) -> dict:
     """Canonical shape of one /api/runs row. The only place a row formats ultimaAct
     (prompt timestamps have their own formatter: fsread._local_ts_label).
 
     `listos` and `activos` do NOT add up to `agentes`: a dead agent counts in neither,
     so the list shows both instead of one ratio that silently hides the difference.
 
-    `tipo` ('workflow' | 'sueltos' | 'chat') exists so the client can tell the three
+    `tipo` ('workflow' | 'sueltos' | 'chat' | 'codex') exists so the client can tell them
     apart WITHOUT sniffing the run-id prefix: a chat has no agent counters to show, and
     printing "0/0" for it would read like a broken run instead of a conversation.
+
+    `tokens` is None for everything except Codex. Claude Code's transcripts carry no token
+    accounting at all, so the column stays empty for its rows rather than showing a zero
+    that would read as "consumed nothing".
     """
     return {"run": run, "workflow": workflow, "proyecto": project, "sesion": session,
             "agentes": agents, "listos": done, "activos": active, "estado": status,
             "ultimaAct": datetime.fromtimestamp(mtime).strftime("%d/%m %H:%M"),
-            "edadSeg": int(now - mtime), "tipo": kind, "kb": kb}
+            "edadSeg": int(now - mtime), "tipo": kind, "kb": kb, "tokens": tokens}
 
 
 def _loose_agent_runs(now: float) -> list[dict]:
@@ -184,11 +190,69 @@ def _workflow_runs(now: float) -> list[dict]:
     return rows
 
 
+def find_codex(run_id: str):
+    """The rollout for a 'codex_<session_id>' id, or None. Same discipline as the other
+    finders: the id is validated against its charset BEFORE it reaches a glob."""
+    if not RE_VALID_RUN_ID.match(run_id or "") or not run_id.startswith("codex_"):
+        return None
+    sess = run_id.removeprefix("codex_")
+    for p in fsread.CODEX_ROOT.glob(f"*/*/*/rollout-*-{sess}.jsonl"):
+        return p
+    return None
+
+
+def _codex_estado(ciclo: str | None, age: int) -> str:
+    """Lifecycle first, recency second -- the same order api_run uses per agent.
+
+    A rollout whose last lifecycle event is task_started and that stopped being written
+    is a session that died or is hung: that is ESTANCADO, not TERMINADO. And 'ciclo is
+    None' is honest ignorance, not a state: only the tail is read, so a very long session
+    can have both of its lifecycle events outside the window.
+    """
+    if ciclo == "complete":
+        return "TERMINADO"
+    if ciclo == "started":
+        return "ACTIVO" if age < RUN_ACTIVE_SECS else "ESTANCADO"
+    return "?"
+
+
+def _codex_runs(now: float) -> list[dict]:
+    """One row per Codex session. These are not Claude Code at all -- they ride in the
+    same list because what you want to see is everything that is working, whoever runs it,
+    and because the cwd of a Codex session frequently points INSIDE the scratchpad of a
+    Claude Code session that launched it."""
+    rows = []
+    for path in fsread.codex_paths():
+        sess = fsread.codex_session_id(path)
+        if not sess:
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if not S_ISREG(st.st_mode):
+            continue
+        e = prompts.codex_entry(path, st.st_size)
+        meta = e["meta"] or {}
+        age = int(now - st.st_mtime)
+        rows.append(_run_row(
+            "codex_" + sess,
+            e["ultimoMensaje"] or Path(str(meta.get("cwd") or "")).name or "(sesion de Codex)",
+            fsread.codex_project(meta),
+            sess[:8],
+            agents=0, done=0, active=0,
+            status=_codex_estado(e["ciclo"], age),
+            mtime=st.st_mtime, now=now, kind="codex", kb=st.st_size // 1024,
+            tokens=(e["tokens"] or {}).get("total_tokens")))
+    return rows
+
+
 def api_runs() -> list[dict]:
     now = time.time()
     # Mixed in one list and sorted by recency: what matters is what moved last, whether
     # that was a workflow, a loose agent or you typing in a chat.
-    runs = _loose_agent_runs(now) + _workflow_runs(now) + _conversation_runs(now)
+    runs = (_loose_agent_runs(now) + _workflow_runs(now)
+            + _conversation_runs(now) + _codex_runs(now))
     runs.sort(key=lambda r: r["edadSeg"])
     return runs
 
@@ -245,7 +309,46 @@ def _chat_run(run_id: str) -> dict | None:
             }]}
 
 
+def _codex_run(run_id: str) -> dict | None:
+    """A Codex session dressed as a run with ONE agent, same as a chat: the whole client
+    then works on it unchanged. `tokens` and `ventana` ride along so the detail view can
+    show consumption and how much of the context window is spent."""
+    path = find_codex(run_id)
+    if not path:
+        return None
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    now = time.time()
+    age = int(now - st.st_mtime)
+    e = prompts.codex_entry(path, st.st_size)
+    tok = e["tokens"] or {}
+    estado = _codex_estado(e["ciclo"], age)
+    return {"run": run_id,
+            "workflow": (e["meta"] or {}).get("cwd") or "(sesion de Codex)",
+            "agentes": [{
+                "id": "codex", "kb": st.st_size // 1024, "edadSeg": age,
+                "estado": estado, "uptimeSeg": None,
+                "mision": e["ultimoMensaje"] or "?",
+                "promptChars": 0,
+                "actividad": e["ultimaTool"] if estado == "ACTIVO" else "",
+                # Solo Codex los reporta: Claude Code no escribe consumo en sus transcripts.
+                # 'tokens*' es el ACUMULADO de la sesion; 'contextoUso' es lo que ocupa la
+                # ventana AHORA, que sale del ultimo turno y no de la suma.
+                "tokens": tok.get("total_tokens"),
+                "tokensEntrada": tok.get("input_tokens"),
+                "tokensCache": tok.get("cached_input_tokens"),
+                "tokensSalida": tok.get("output_tokens"),
+                "tokensRazonamiento": tok.get("reasoning_output_tokens"),
+                "contextoUso": (e["ultimoTurno"] or {}).get("input_tokens"),
+                "ventana": e["ventana"],
+            }]}
+
+
 def api_run(run_id: str) -> dict | None:
+    if (run_id or "").startswith("codex_"):
+        return _codex_run(run_id)
     if (run_id or "").startswith("chat_"):
         return _chat_run(run_id)
     run_dir = find_run_dir(run_id)
@@ -317,6 +420,18 @@ def _transcript_events(path) -> list[dict]:
 
 
 def api_agent(run_id: str, agent_id: str, n: int = 120) -> dict | None:
+    if (run_id or "").startswith("codex_"):
+        path = find_codex(run_id)
+        if not path or agent_id != "codex":
+            return None
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        e = prompts.codex_entry(path, size)
+        return {"agente": fsread.codex_session_id(path)[:8],
+                "mision": e["ultimoMensaje"] or "?",
+                "eventos": fsread.codex_events(path, n)}
     if (run_id or "").startswith("chat_"):
         path = find_conversation(run_id)
         if not path or agent_id != "chat":   # a chat has exactly one pseudo-agent
@@ -368,6 +483,25 @@ _PROMPT_FIELDS = {"texto": "", "chars": 0, "kb": 0, "ts": "", "cwd": "", "gitBra
 
 def api_prompt(run_id: str, agent_id: str) -> dict | None:
     """FULL prompt of one agent. Untruncated: the 378 KB one is precisely an interesting one."""
+    if (run_id or "").startswith("codex_"):
+        path = find_codex(run_id)
+        if not path or agent_id != "codex":
+            return None
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        texto = fsread.codex_first_prompt(path)
+        meta = prompts.codex_entry(path, st.st_size)["meta"] or {}
+        return {"run": run_id, "agente": "codex", **_PROMPT_FIELDS,
+                "titulo": prompts.title_of(texto) or "(sesion de Codex)",
+                "texto": texto, "chars": len(texto), "kb": st.st_size // 1024,
+                "cwd": meta.get("cwd") or "",
+                "version": str(meta.get("cli_version") or ""),
+                "agentType": "codex",
+                "description": str(meta.get("model_provider") or ""),
+                "pre": 0, "suf": 0, "familia": 1,
+                "aviso": "" if texto else "no pude leer el primer mensaje de esta sesion"}
     if (run_id or "").startswith("chat_"):
         # A chat has no launch prompt, but it does have the message that OPENED it, and
         # that is the closest analogue: what this conversation was started to do.
@@ -472,6 +606,11 @@ def api_plan(run_id: str) -> dict | None:
             return None
         return {"run": run_id, "agentes": 1, "terminados": 0,
                 "plan": None, "script": "", "motivo": "chat"}
+    if (run_id or "").startswith("codex_"):
+        if not find_codex(run_id):
+            return None
+        return {"run": run_id, "agentes": 1, "terminados": 0,
+                "plan": None, "script": "", "motivo": "codex"}
     run_dir = find_run_dir(run_id)
     if not run_dir:
         return None

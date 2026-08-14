@@ -104,6 +104,14 @@
   .b-REEMPLAZADO { background: var(--muted-bg); color: var(--muted); }
   /* INACTIVO es de los CHATS: una conversacion no "termina", solo deja de moverse. */
   .b-INACTIVO { background: var(--muted-bg); color: var(--muted); }
+  /* "?" es de CODEX: solo se lee la cola del rollout, asi que una sesion muy larga puede
+     tener sus dos eventos de ciclo de vida fuera de la ventana. Es no saber, no un estado. */
+  .b-\? { background: var(--muted-bg); color: var(--muted); }
+  /* de que plataforma viene la fila */
+  .plat { font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--muted); border: 1px solid var(--border); border-radius: 3px;
+    padding: 0 4px; margin-right: 5px; vertical-align: 1px; }
+  .toks { font-variant-numeric: tabular-nums; }
   .wf { font-weight: 600; }
   .sub { color: var(--muted); font-size: 11.5px; }
   /* lista de runs: fixed + ellipsis. Sin esto los nombres largos de proyecto
@@ -233,6 +241,10 @@ const esc = t => String(t == null ? "" : t).replace(/[&<>"']/g, c => ESCAPES[c])
 // comillas o backslash rompia el atributo aunque esc() lo pasara.
 const idsafe = t => String(t == null ? "" : t).replace(/[^A-Za-z0-9_.-]/g, "");
 const kb = n => n < 1024 ? n + " car." : (n / 1024).toFixed(1) + " KB";
+// Los totales de Codex llegan a los millones: 1.300.785 no entra en la fila y no se lee.
+const fmtTok = n => n < 1000 ? String(n)
+  : n < 1e6 ? (n / 1000).toFixed(n < 1e4 ? 1 : 0) + "k"
+  : (n / 1e6).toFixed(2) + "M";
 
 async function j(url) {
   try {
@@ -288,16 +300,20 @@ function pintarRuns() {
   repintar($("#runs"), filas.map(r => {
     const nombre = esc(r.workflow) || "(sin nombre)";
     const donde = `${esc(r.proyecto)} · ${esc(r.sesion)}`;
-    // Un chat no tiene agentes que contar: "0/0" se leeria como un run roto. Va su
-    // tamaño, que es lo que dice cuanto pasó en esa conversacion.
-    const cuenta = r.tipo === "chat"
-      ? `${kb(r.kb * 1024)} · ${fmtEdad(r.edadSeg)}`
-      : `${r.listos}/${r.agentes} · ${fmtEdad(r.edadSeg)}`;
+    // Ni un chat ni una sesion de Codex tienen agentes que contar: "0/0" se leeria como
+    // un run roto. En su lugar va lo que si dice cuanto pasó ahi -- para Codex los tokens,
+    // que es el dato que ninguna otra plataforma escribe; para un chat, el tamaño.
+    const cuenta = r.tipo === "codex"
+      ? `${r.tokens != null ? fmtTok(r.tokens) + " tok" : kb(r.kb * 1024)} · ${fmtEdad(r.edadSeg)}`
+      : r.tipo === "chat"
+        ? `${kb(r.kb * 1024)} · ${fmtEdad(r.edadSeg)}`
+        : `${r.listos}/${r.agentes} · ${fmtEdad(r.edadSeg)}`;
     return `
     <tr class="row ${r.run===selRun?"sel":""}" data-k="${idsafe(r.run)}" onclick="verRun('${idsafe(r.run)}')"
         title="${nombre} — ${donde}\n${r.activos} activos · ${r.listos} de ${r.agentes} terminados · última actividad ${r.ultimaAct}">
       <td>
-        <div class="wf">${r.estado==="ACTIVO"?'<span class="pulse"></span>':""}${nombre}</div>
+        <div class="wf">${r.estado==="ACTIVO"?'<span class="pulse"></span>':""}${
+          r.tipo==="codex"?'<span class="plat">codex</span>':""}${nombre}</div>
         <div class="sub linea">${donde}</div>
         <div class="sub linea">${esc(r.run)}</div>
       </td>
@@ -326,6 +342,7 @@ const SIN_PLAN = {
   "ilegible": "El script existe pero no se pudo leer (ruta demasiado larga o sin permisos).",
   "sin-meta": "El script no declara un bloque meta, así que no hay plan que mostrar.",
   "chat": "Es una conversación, no un workflow: no hay plan declarado. Abrí el agente para ver su actividad, o “prompt” para el mensaje que la abrió.",
+  "codex": "Es una sesión de Codex, no un workflow de Claude Code: no hay plan declarado. Abrí el agente para ver su feed y su consumo de tokens.",
 };
 
 async function cargarPlan(run) {
@@ -373,7 +390,12 @@ async function refrescarRun() {
   const head = $("#runHead"), box = $("#agentsBox");
   if (!head || !box) return;
   if (d.error) { box.innerHTML = `<div class="empty">${esc(d.error)}</div>`; return; }
-  const ags = d.agentes.filter(a => mostrarTerminados || !INACTIVOS.includes(a.estado));
+  // Un chat y una sesion de Codex se representan con UN pseudo-agente. Filtrarlo por
+  // "terminado" deja el panel vacio, que no es lo que ese filtro quiere decir: existe para
+  // esconder los que ya cerraron dentro de un fan-out de cien, no para ocultar el unico
+  // que hay. Al abrir una sesion de Codex cerrada no se veia absolutamente nada.
+  const unico = selRun.startsWith("chat_") || selRun.startsWith("codex_");
+  const ags = d.agentes.filter(a => unico || mostrarTerminados || !INACTIVOS.includes(a.estado));
   const ocultos = d.agentes.length - ags.length;
   repintar(head, `<b>${esc(d.workflow) || esc(d.run)}</b> <span class="sub">${esc(d.run)}</span>
     <label class="chk"><input type="checkbox" data-k="chk-term" ${mostrarTerminados?"checked":""}
@@ -398,6 +420,23 @@ function tiemposHTML(a) {
   return `<div class="sub">${vida} · ${desde}</div>`;
 }
 
+// Consumo, solo para las filas que lo traen (hoy: Codex). El resto no muestra nada en vez
+// de un 0, que se leeria como "no consumio" y no como "no lo reporta".
+// El % de cache importa: es la parte del contexto que NO se recobra, y en las sesiones
+// largas de verificacion llega al 94%.
+function tokensHTML(a) {
+  if (a.tokens == null) return "";
+  const pct = a.tokensCache ? Math.round(100 * a.tokensCache / a.tokens) : null;
+  // contextoUso es el ULTIMO turno, no el acumulado: dividir el acumulado por la ventana
+  // daba cosas como "contexto 553%".
+  const ctx = a.ventana && a.contextoUso
+    ? ` · contexto ${Math.round(100 * a.contextoUso / a.ventana)}%` : "";
+  return `<div class="toks"><b>${fmtTok(a.tokens)}</b> tokens${
+    pct != null ? ` · ${pct}% cache` : ""}${ctx}</div>
+    <div class="sub toks">${fmtTok(a.tokensEntrada || 0)} in · ${fmtTok(a.tokensSalida || 0)} out${
+      a.tokensRazonamiento ? ` · ${fmtTok(a.tokensRazonamiento)} razonamiento` : ""}</div>`;
+}
+
 function tablaAgentes(ags) {
   return `<table>
     <thead><tr><th>Agente</th><th>Misión</th><th>Estado</th><th class="num">KB</th><th>Actividad actual</th><th></th></tr></thead>
@@ -407,7 +446,7 @@ function tablaAgentes(ags) {
         <td class="mision" title="${esc(a.mision)}">${esc(a.mision)}</td>
         <td><span class="badge b-${a.estado}">${a.estado}</span>${tiemposHTML(a)}</td>
         <td class="num">${a.kb}</td>
-        <td class="sub">${esc(a.actividad) || "—"}</td>
+        <td class="sub">${tokensHTML(a)}${esc(a.actividad) || (a.tokens == null ? "—" : "")}</td>
         <td><a class="back" data-k="p-${idsafe(a.id)}" onclick="event.stopPropagation();abrirPrompt(selRun,'${idsafe(a.id)}')">prompt${a.promptChars ? ` <span class="sub">${kb(a.promptChars)}</span>` : ""}</a></td>
       </tr>`).join("") || '<tr><td colspan="6" class="empty">Sin agentes en curso — tildá "mostrar terminados/muertos"</td></tr>'}
     </tbody>

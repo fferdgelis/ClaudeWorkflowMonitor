@@ -372,6 +372,188 @@ def conversation_first_prompt(path: Path) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------- codex
+# OpenAI Codex writes one JSONL per session, date-partitioned:
+#   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<iso-ts>-<session_id>.jsonl
+# One JSON event per line, and LINE 0 is the session metadata -- the same shape Claude
+# Code uses, which is why this fits the monitor without bending anything:
+#   {"timestamp":..., "type":"session_meta",  "payload":{session_id, cwd, git, cli_version,
+#                                                        model_provider, context_window}}
+#   {"timestamp":..., "type":"event_msg",     "payload":{"type":"task_started"|"task_complete"
+#                                                        |"agent_message"|"user_message"
+#                                                        |"token_count", ...}}
+#   {"timestamp":..., "type":"response_item", "payload":{"type":"custom_tool_call"|"function_call"
+#                                                        |"message"|"reasoning", "name":...}}
+#
+# task_started / task_complete are the lifecycle pair: they play the role the journal plays
+# for a workflow run, and like the journal they are only trustworthy as "the LAST one wins"
+# -- counting them breaks, because only the tail of the file is read and an early
+# task_started falls outside the window.
+#
+# token_count is the reason this is worth doing at all: Claude Code's transcripts carry no
+# token accounting, so the dashboard has never been able to show consumption. Codex reports
+# it per turn AND cumulative, plus the size of the context window.
+CODEX_ROOT = Path(os.environ.get("CODEX_SESSIONS_DIR") or Path.home() / ".codex" / "sessions")
+
+CODEX_TAIL_BYTES = 256 * 1024
+RE_CODEX_ID = re.compile(r"^rollout-.+-([0-9a-fA-F-]{36})\.jsonl$")
+RE_TOOL_NAME = re.compile(r'"name"\s*:\s*"([^"]{1,60})"')
+
+
+def codex_paths():
+    """The rollouts. Explicit depth instead of rglob(): same reason as _iter_agent_paths --
+    rglob walks into directories past MAX_PATH and dies there."""
+    yield from CODEX_ROOT.glob("*/*/*/rollout-*.jsonl")
+
+
+def codex_session_id(path: Path) -> str:
+    m = RE_CODEX_ID.match(path.name)
+    return m.group(1) if m else ""
+
+
+# Un cwd de Codex no sirve como nombre de proyecto tal cual: la mayoria de las sesiones
+# corren en un directorio que Codex se crea solo, bajo Documents\Codex\<fecha>\<slug>,
+# donde el slug es un pedazo del prompt. Tomar el basename llenaba el filtro de proyectos
+# con cuarenta entradas del tipo "aca", "ne", "yeah" o "give-me-a-morning-brief-with".
+RE_CLAUDE_SCRATCH = re.compile(r"[\\/]Temp[\\/]claude[\\/]([^\\/]+)[\\/]", re.I)
+RE_CODEX_SCRATCH = re.compile(r"[\\/]Documents[\\/]Codex[\\/]\d{4}-\d{2}-\d{2}[\\/]", re.I)
+
+
+def codex_project(meta: dict) -> str:
+    """A que proyecto atribuir una sesion de Codex, en orden de que tan confiable es.
+
+    1. Si el cwd cae dentro del scratchpad de una sesion de Claude Code, gana el proyecto
+       de ESA sesion. Ademas de ser el nombre correcto, es lo que hace visible el
+       parentesco: 16 de las 179 sesiones del corpus son agentes que Claude mando a
+       trabajar, y asi aparecen al lado del chat que las lanzo.
+    2. Si no, el repo de git que Codex anota en session_meta.
+    3. Si el cwd es el scratch propio de Codex, no hay proyecto: una etiqueta unica, no
+       cuarenta pedazos de prompt.
+    """
+    cwd = str(meta.get("cwd") or "")
+    m = RE_CLAUDE_SCRATCH.search(cwd)
+    if m:
+        return clean_project_slug(m.group(1))
+    git = meta.get("git")
+    url = (git or {}).get("repository_url") if isinstance(git, dict) else None
+    if isinstance(url, str) and url.strip():
+        return url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    if RE_CODEX_SCRATCH.search(cwd):
+        return "(Codex sin proyecto)"
+    return Path(cwd).name or "?"
+
+
+def codex_meta(path: Path) -> dict:
+    """Line 0 of a rollout: written at spawn and never rewritten, so it is immutable and
+    worth caching (see prompts.codex_entry)."""
+    try:
+        with path.open("rb") as f:
+            raw = f.readline(2 * 1024 * 1024)
+        ev = json.loads(raw.decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(ev, dict) or ev.get("type") != "session_meta":
+        return {}
+    p = ev.get("payload")
+    return p if isinstance(p, dict) else {}
+
+
+def codex_tail(path: Path) -> dict:
+    """State, tokens and current activity, from the TAIL of the rollout.
+
+    Everything here comes from one pass over the last CODEX_TAIL_BYTES: the corpus is
+    277 MB across 178 files and /api/runs sweeps all of them, so reading whole files is
+    out of the question. Each line is cheap-tested with `in` before paying json.loads --
+    the same trick the agent readers use.
+    """
+    ciclo = None          # "started" | "complete": the LAST one wins
+    # DOS contadores distintos y facilisimos de confundir:
+    #   total_token_usage -> acumulado de TODA la sesion. Es lo que se consumio.
+    #   last_token_usage  -> el ULTIMO turno. Su input es lo que ocupa la ventana AHORA.
+    # Dividir el acumulado por la ventana daba "contexto 553%": un numero sin sentido con
+    # aspecto de metrica.
+    tokens = ultimo_turno = ventana = None
+    ultimo_msg = ultima_tool = ""
+    for line in tail_lines(path, CODEX_TAIL_BYTES):
+        if '"task_started"' in line:
+            ciclo = "started"
+        elif '"task_complete"' in line:
+            ciclo = "complete"
+        if '"token_count"' in line:
+            try:
+                info = (json.loads(line).get("payload") or {}).get("info") or {}
+            except ValueError:
+                continue
+            tokens = info.get("total_token_usage") or tokens
+            ultimo_turno = info.get("last_token_usage") or ultimo_turno
+            ventana = info.get("model_context_window") or ventana
+        elif '"custom_tool_call"' in line or '"function_call"' in line:
+            m = RE_TOOL_NAME.search(line)
+            if m:
+                ultima_tool = m.group(1)
+        elif '"agent_message"' in line:
+            try:
+                msg = (json.loads(line).get("payload") or {}).get("message")
+            except ValueError:
+                continue
+            if isinstance(msg, str) and msg.strip():
+                ultimo_msg = msg.replace("\n", " ").strip()[:200]
+    return {"ciclo": ciclo, "tokens": tokens or {}, "ultimoTurno": ultimo_turno or {},
+            "ventana": ventana, "ultimoMensaje": ultimo_msg, "ultimaTool": ultima_tool}
+
+
+def codex_first_prompt(path: Path) -> str:
+    """The user_message that opened the session: the analogue of an agent's line-0 prompt."""
+    for line in head_lines(path, 80):
+        if '"user_message"' not in line:
+            continue
+        try:
+            p = json.loads(line).get("payload") or {}
+        except ValueError:
+            continue
+        if p.get("type") == "user_message" and isinstance(p.get("message"), str):
+            return p["message"]
+    return ""
+
+
+def codex_events(path: Path, n: int = 120) -> list[dict]:
+    """Feed of a Codex session, in the same {ts, tipo, txt} shape the client already
+    paints for agents. TOOL/DICE/RES are the API contract and stay in Spanish."""
+    out = []
+    for line in tail_lines(path, CODEX_TAIL_BYTES):
+        if '"payload"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        p = ev.get("payload")
+        if not isinstance(p, dict):
+            continue
+        ts = ""
+        m = RE_TS.search(line)
+        if m:
+            try:
+                ts = datetime.fromisoformat(m.group(1).replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
+            except ValueError:
+                ts = ""
+        t = p.get("type")
+        if t in ("custom_tool_call", "function_call"):
+            arg = p.get("input") or p.get("arguments") or ""
+            out.append({"ts": ts, "tipo": "TOOL",
+                        "txt": f"{p.get('name') or '?'}  {str(arg)[:110]}".strip()})
+        elif t in ("custom_tool_call_output", "function_call_output"):
+            sal = p.get("output")
+            if isinstance(sal, list):
+                sal = " ".join(str(b.get("text", "")) for b in sal if isinstance(b, dict))
+            out.append({"ts": ts, "tipo": "RES", "txt": str(sal or "").replace("\n", " ")[:150]})
+        elif t == "agent_message" and isinstance(p.get("message"), str):
+            out.append({"ts": ts, "tipo": "DICE", "txt": p["message"].replace("\n", " ")[:180]})
+        elif t == "user_message" and isinstance(p.get("message"), str):
+            out.append({"ts": ts, "tipo": "DICE", "txt": "(vos) " + p["message"].replace("\n", " ")[:170]})
+    return out[-n:]
+
+
 def _iter_agent_paths():
     """The only two path shapes that exist. rglob() is out: it steps on dirs beyond MAX_PATH."""
     for pattern in ("*/*/subagents/agent-*.jsonl", "*/*/subagents/workflows/wf_*/agent-*.jsonl"):
