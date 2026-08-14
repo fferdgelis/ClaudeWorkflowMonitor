@@ -285,7 +285,7 @@ function pintarRuns() {
   // y queda completo en el title.
   repintar($("#runs"), filas.map(r => {
     const nombre = esc(r.workflow) || "(sin nombre)";
-    const donde = `${esc(r.proyecto)} · ${r.sesion}`;
+    const donde = `${esc(r.proyecto)} · ${esc(r.sesion)}`;
     const cuenta = `${r.listos}/${r.agentes} · ${fmtEdad(r.edadSeg)}`;
     return `
     <tr class="row ${r.run===selRun?"sel":""}" data-k="${idsafe(r.run)}" onclick="verRun('${idsafe(r.run)}')"
@@ -293,7 +293,7 @@ function pintarRuns() {
       <td>
         <div class="wf">${r.estado==="ACTIVO"?'<span class="pulse"></span>':""}${nombre}</div>
         <div class="sub linea">${donde}</div>
-        <div class="sub linea">${r.run}</div>
+        <div class="sub linea">${esc(r.run)}</div>
       </td>
       <td class="der">
         <span class="badge b-${r.estado}">${r.estado}</span>
@@ -348,7 +348,7 @@ function pintarPlan() {
   // El progreso va SEPARADO de las fases a propósito: en disco no queda registro de a qué fase
   // pertenece cada agente, y con pipeline() se solapan. Cruzarlos sería inventar la progresión.
   box.innerHTML = `<div class="plan">
-    <b>${esc(p.nombre) || d.run}</b> <span class="sub">— plan declarado</span>
+    <b>${esc(p.nombre) || esc(d.run)}</b> <span class="sub">— plan declarado</span>
     ${p.descripcion ? `<div class="sub pd">${esc(p.descripcion)}</div>` : ""}
     ${fases}
     <span class="sub">${d.agentes} agentes · ${d.terminados} terminados</span>
@@ -368,7 +368,7 @@ async function refrescarRun() {
   if (d.error) { box.innerHTML = `<div class="empty">${esc(d.error)}</div>`; return; }
   const ags = d.agentes.filter(a => mostrarTerminados || !INACTIVOS.includes(a.estado));
   const ocultos = d.agentes.length - ags.length;
-  repintar(head, `<b>${esc(d.workflow) || d.run}</b> <span class="sub">${d.run}</span>
+  repintar(head, `<b>${esc(d.workflow) || esc(d.run)}</b> <span class="sub">${esc(d.run)}</span>
     <label class="chk"><input type="checkbox" data-k="chk-term" ${mostrarTerminados?"checked":""}
       onchange="mostrarTerminados=this.checked;refrescarRun()"> mostrar terminados/muertos${ocultos ? ` (${ocultos})` : ""}</label>
     <label class="chk"><input type="checkbox" data-k="chk-fam" ${agrupar?"checked":""}
@@ -396,7 +396,7 @@ function tablaAgentes(ags) {
     <thead><tr><th>Agente</th><th>Misión</th><th>Estado</th><th class="num">KB</th><th>Actividad actual</th><th></th></tr></thead>
     <tbody>${ags.map(a => `
       <tr class="row" data-k="${idsafe(a.id)}" onclick="verAgente('${idsafe(a.id)}')">
-        <td class="sub">${a.id.slice(0,10)}</td>
+        <td class="sub">${esc(a.id.slice(0,10))}</td>
         <td class="mision" title="${esc(a.mision)}">${esc(a.mision)}</td>
         <td><span class="badge b-${a.estado}">${a.estado}</span>${tiemposHTML(a)}</td>
         <td class="num">${a.kb}</td>
@@ -441,7 +441,7 @@ ${esc(f.moldeSuf)}</pre>` : ""}</td></tr>`;
         filas += f.agentes.map(a => {
           const e = est[a.id] || {};
           return `<tr class="row" data-k="${idsafe(a.id)}" onclick="abrirPrompt(selRun,'${idsafe(a.id)}')">
-            <td style="padding-left:26px"><span class="sub">${a.id.slice(0,10)} · ${a.ts}</span>
+            <td style="padding-left:26px"><span class="sub">${esc(a.id.slice(0,10))} · ${esc(a.ts)}</span>
               <div class="varv" title="${esc(a.variable)}">${esc(a.variable) || "(sin parte propia: recibió el molde tal cual)"}</div></td>
             <td></td><td></td>
             <td class="num">${kb(a.varChars)}</td>
@@ -480,7 +480,7 @@ async function refrescarFeed(primeraVez) {
   wrap.innerHTML = `
     <div class="head"><a class="back" onclick="selAgent=null;verRun(selRun)">← volver</a>
       ${tabsHTML()}
-      <b>${esc(d.mision)}</b> <span class="sub">${d.agente}</span>
+      <b>${esc(d.mision)}</b> <span class="sub">${esc(d.agente)}</span>
       <label class="chk"><input type="checkbox" ${tailOn?"checked":""}
         onchange="tailOn=this.checked; if(tailOn) refrescarFeed(true)"> seguir el final (tail&nbsp;-f)</label>
     </div>
@@ -517,7 +517,7 @@ async function abrirPrompt(run, id) {
     <div class="head"><a class="back" onclick="selAgent=null;verRun(selRun)">← volver</a>
       ${tabsHTML()}
       <b>${esc(d.titulo || d.description || d.agente)}</b>
-      <span class="sub">${d.agente} · ${kb(d.chars)}${d.ts ? " · " + d.ts : ""}</span>
+      <span class="sub">${esc(d.agente)} · ${kb(d.chars)}${d.ts ? " · " + esc(d.ts) : ""}</span>
       ${propio ? `<label class="chk"><input type="checkbox" ${soloVariable?"checked":""}
         onchange="soloVariable=this.checked;promptCompleto=false;pintarPrompt()">
         solo lo propio de este agente <span class="sub">(la familia comparte ${kb(d.pre + d.suf)})</span></label>` : ""}
@@ -596,7 +596,7 @@ async function buscarPrompts() {
     <div>${d.hits.map(h => `
       <div class="hit" onclick="abrirPrompt('${idsafe(h.run)}','${idsafe(h.agente)}')">
         <div><b>${esc(h.titulo)}</b></div>
-        <div class="sub">${esc(h.proyecto)} · ${esc(h.workflow) || h.run} · ${h.agente.slice(0,10)} · ${h.ts} · ${esc(h.agentType)}${h.description ? " · " + esc(h.description) : ""} · ${kb(h.chars)} · ${h.n} match${h.n>1?"es":""}</div>
+        <div class="sub">${esc(h.proyecto)} · ${esc(h.workflow) || esc(h.run)} · ${esc(h.agente.slice(0,10))} · ${esc(h.ts)} · ${esc(h.agentType)}${h.description ? " · " + esc(h.description) : ""} · ${kb(h.chars)} · ${h.n} match${h.n>1?"es":""}</div>
         ${h.ctx.map(c => `<div class="ctx">${esc(c.pre)}<mark>${esc(c.hit)}</mark>${esc(c.post)}</div>`).join("")}
       </div>`).join("") || '<div class="empty">Ningún prompt contiene ese texto</div>'}</div>`;
 }

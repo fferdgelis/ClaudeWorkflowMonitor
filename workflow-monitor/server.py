@@ -34,6 +34,32 @@ __version__ = "1.0.0"
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 
 
+# Host headers this server answers to. Binding 127.0.0.1 keeps other MACHINES out, but it
+# does NOT keep other WEBSITES out: with DNS rebinding, a page on attacker.com whose name
+# is re-resolved to 127.0.0.1 reaches this server, and the browser treats the response as
+# same-origin (the document's origin IS attacker.com:8787), so the same-origin policy never
+# gets a say. Without this check any page the user visits could read /api/search and walk
+# off with every prompt and transcript on disk. Browsers always send Host, so matching it
+# is the whole defense.
+ALLOWED_HOSTS = frozenset(("127.0.0.1", "localhost", "::1"))
+
+
+def host_allowed(header: str | None) -> bool:
+    """True if the Host header names this loopback server. An ABSENT Host is allowed:
+    HTTP/1.0 clients (curl -0, scripts) legitimately omit it and none of them are a
+    rebinding vector -- the attack needs a browser, and browsers always send it."""
+    host = (header or "").strip()
+    if not host:
+        return True
+    if host.startswith("["):                      # [::1]:8787
+        name = host[1:].partition("]")[0]
+    elif host.count(":") == 1:                    # 127.0.0.1:8787 / localhost:8787
+        name = host.rsplit(":", 1)[0]
+    else:                                         # bare name, or bare IPv6 without brackets
+        name = host
+    return name in ALLOWED_HOSTS
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -47,6 +73,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        # Antes de tocar disco: un Host ajeno es una pagina web, no el dashboard.
+        if not host_allowed(self.headers.get("Host")):
+            self._json({"error": "host no permitido"}, 403)
+            return
         url = urlparse(self.path)
         q = parse_qs(url.query)
         try:
